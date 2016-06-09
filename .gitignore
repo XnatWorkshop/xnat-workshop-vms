@@ -1,0 +1,12 @@
+.idea
+.work
+.tmp
+.vagrant
+*.war
+*.zip
+*.tar.gz
+*.class
+local*
+*--xx*
+*.log
+*.vdi

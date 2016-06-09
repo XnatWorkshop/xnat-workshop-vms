@@ -1,0 +1,71 @@
+#!/bin/bash
+
+# This script is to be executed from inside the VM to redeploy a
+# previously deployed web app or deploy a newly downloaded war file.
+
+OWD=`dirname $0`
+
+# Exit with error status
+die() {
+    echo >&2 "$@"
+    exit -1
+}
+
+[[ -e ${OWD}/vars.sh  ]] || die "vars.sh file is required for redeploy script"
+
+source ${OWD}/vars.sh
+source ${OWD}/macros
+
+echo
+echo Stopping Tomcat...
+sudo service tomcat7 stop
+
+echo
+echo Deleting web app and redeploying XNAT...
+
+sudo rm -Rf /var/lib/tomcat7/webapps/ROOT*
+
+echo
+
+if [[ -e /vagrant-root/local/downloads/${XNAT_SRC##*/} && ${XNAT_SRC##*/} == *.war  ]]; then
+    echo Copying war file...
+    cp -fv /vagrant-root/local/downloads/${XNAT_SRC##*/} /var/lib/tomcat7/webapps/ROOT.war
+elif [[ -e ${DATA_ROOT}/src/${XNAT_DIR}/build/libs/ROOT.war ]]; then
+    echo Copying war file...
+    cp -fv ${DATA_ROOT}/src/${XNAT_DIR}/build/libs/ROOT.war /var/lib/tomcat7/webapps/ROOT.war
+else
+    die "XNAT war file not found."
+fi
+
+# Reset database?
+DESTROY=N
+echo
+read -p "Would you like to reset the database? ALL DATABASE DATA IN THIS VM WILL BE DESTROYED. [y/N] " DESTROY
+
+if [[ $DESTROY =~ [Yy] ]]; then
+    echo
+    echo "Dropping '${PROJECT}' database."
+    dropdb -U $VM_USER $PROJECT
+    echo
+    echo "Creating new '${PROJECT}' database."
+    createdb -U $VM_USER $PROJECT
+fi
+
+echo
+echo Restarting Tomcat...
+startTomcat
+
+monitorTomcatStartup
+
+STATUS=$?
+if [[ ${STATUS} == 0 ]]; then
+    echo "==========================================================="
+    echo "Redeploy completed successfully."
+    echo "==========================================================="
+    exit 0;
+else
+    echo The application does not appear to have started properly. Status code: ${STATUS}
+    echo The last lines in the log are:; tail -n 40 /var/log/tomcat7/catalina.out;
+fi
+
+exit ${STATUS}

@@ -1,0 +1,235 @@
+#!/bin/bash
+
+# cache the *original working directory if not already defined
+
+[[ -z $OWD ]] && OWD=`dirname $0`
+
+# replaceTokens function takes the template name from the first argument to the function call and cats that file out.
+# It then replaces all of the tokens with values from vars.sh, then puts the output into the file indicated by the
+# second argument to the function.
+replaceTokens() {
+    cat /vagrant-root/templates/$1.tmpl | sed -f /vagrant/.work/vars.sed
+}
+
+# create default XNAT data folders
+setupFolders() {
+
+    DATA_ROOT=$1
+    VM_USER=$2
+
+    sudo mkdir -p \
+        ${DATA_ROOT}/src \
+        ${DATA_ROOT}/archive \
+        ${DATA_ROOT}/build \
+        ${DATA_ROOT}/cache \
+        ${DATA_ROOT}/ftp \
+        ${DATA_ROOT}/pipeline/modules \
+        ${DATA_ROOT}/prearchive
+
+
+    # Copy some scripts to the local bin folder
+    sudo cp -fv /vagrant/.work/vars.sh /usr/local/bin
+    sudo find /vagrant-root/scripts -maxdepth 1 -type f ! -name *.sh -exec cp '{}' /usr/local/bin \;
+    for URL_FILE in /vagrant-root/scripts/lib/*; do
+        DEST=$(basename ${URL_FILE})
+        URL=$(cat ${URL_FILE})
+        sudo wget -nv ${URL} -O /usr/local/lib/${DEST}
+    done
+    
+    sudo chmod +x /usr/local/bin/*
+
+    [[ ! -z ${VM_USER} ]] && { sudo chown -R ${VM_USER}:${VM_USER} /data ${DATA_ROOT}; }
+}
+
+getProjectDir() {
+    DIRS=($(ls /data))
+    if [[ ((${#DIRS[@]} == 1)) ]]; then
+        PROJECT=`ls -1 /data`
+    else
+        echo "Which project folder do you want to use for capture/restore operations?"
+        echo ""
+        for INDEX in ${!DIRS[@]}; do
+            echo "$((INDEX + 1)) ${DIRS[INDEX]}"
+        done
+        echo ""
+        read -p "Select: " SELECT
+        echo ""
+        CHOICE=$(expr ${SELECT} - 1)
+        PROJECT=${DIRS[$((CHOICE))]}
+    fi
+}    
+
+copyLocalFolder() {
+    SRC=$1
+    DEST=$2
+    echo Copying local folder ${SRC} to ${DEST}
+    sudo mkdir -p ${DEST}
+    # The `find` here excludes common generated folders in the XNAT builder and pipeline installer folders.
+    # It also excludes files and folders that start with the "." character, mainly to exclude the Mercurial metadata.
+    sudo find ${SRC} -mindepth 1 -maxdepth 1 \
+    ! -name ".[A-z0-9]*" \
+    ! -name build \
+    ! -name deployments \
+    ! -name lib \
+    ! -name pipeline \
+    ! -name projects \
+    ! -name work \
+    ! -name "*.log" \
+    ! -name "*.[ei]ml" \
+    ! -name "build.properties" \
+    -exec cp -rf '{}' ${DEST} \;
+    status=$?
+
+    # Clear any cached, downloaded, or generated dependencies before doing clean build.
+    [[ -d ${DEST}/plugin-resources/cache ]] && { sudo rm -rf ${DEST}/plugin-resources/cache; }
+    [[ -d ${DEST}/plugin-resources/repository/nrg ]] && { sudo find ${DEST}/plugin-resources/repository -maxdepth 2 -name jars -exec rm -rf '{}' \;; }
+
+    # Removes above will set to non-0 code if folders not found, we want to use code from find copy.
+    return ${status}
+}
+
+
+firstFound=""
+
+# usage:
+# findFirst file.txt /path/to/dir1 ./dir2 ./dir3/dir4
+# returns first found path (or empty string if not found) as $firstFound var
+findFirst() {
+
+    FILENAME=$1
+
+    shift
+
+    # reset $firstFound var
+    firstFound=""
+	# return if we find it right away
+	if [[ -e $FILENAME ]]; then
+	    firstFound=$FILENAME
+	    return 0
+	fi
+	# or check the list of directories
+	for dir in $@
+	do
+		if [[ -e $dir/$FILENAME ]]; then
+			firstFound=$dir/$FILENAME
+			return 0
+		fi
+		continue
+	done
+	return 1
+}
+
+
+copyLocal() {
+
+    DIRS=$2
+
+    # set default folders to look in, if not specified
+    [[ -z $2 ]] && { DIRS="src local /src /vagrant /vagrant/src /vagrant-root /vagrant-root/local /vagrant-root/src"; }
+
+    # look in a few different places
+    findFirst $1 ${DIRS}
+
+    if [[ ${firstFound} != "" ]]; then
+        SRC=${firstFound}
+    else
+        return 1
+    fi
+
+    # special handling of folders
+    if [[ -d ${SRC} ]]; then
+        copyLocalFolder ${SRC} ${DATA_ROOT}/src/${SRC##*/}
+        copied=$?
+    else
+        echo Copying ${SRC} into ${DATA_ROOT}/src
+        cp -rf ${SRC} ${DATA_ROOT}/src
+        copied=$?
+    fi
+
+    if [[ $copied == 0 ]]; then
+        # if doing a copy, reset permissions
+        sudo chown -Rf ${VM_USER}.${VM_USER} /data
+    fi
+
+    return $copied
+
+}
+
+
+uncompress() {
+
+    SRC=$1
+
+    cd ${DATA_ROOT}/src
+
+    if [[ -d ${SRC} ]]; then
+        return 0;
+    fi
+
+    if [[ ${SRC} == *.tar.gz ]]; then
+        echo "Extracting gzip archive..."
+        tar -zxf ${SRC}
+        #rm ${SRC}
+    elif [[ ${SRC} == *.zip && -f ${SRC} ]]; then
+        echo "Extracting zip archive..."
+        unzip -qo ${SRC}
+        #rm ${SRC}
+    fi
+
+}
+
+
+startTomcat() {
+    [[ $(sudo service tomcat7 status) == *running* ]] \
+        && { echo Tomcat 7 is running, restarting.; sudo service tomcat7 restart || die "Tomcat startup failed."; } \
+        || { echo Tomcat 7 is not running, starting.; sudo service tomcat7 start || die "Tomcat startup failed."; }
+}
+
+monitorTomcatLog() {
+    INDEX=0
+    until [[ -e /var/log/tomcat7/catalina.out || ${INDEX} > 5 ]]; do
+        ((INDEX += 1))
+        sleep 2
+    done
+    [[ -e /var/log/tomcat7/catalina.out ]] && { return 0; } || { return 127; }
+}
+
+monitorTomcatStatus() {
+    STATUS_MSG="^INFO: Server startup in"
+    QUIET="--quiet"
+    WAIT_FOR=120
+    while [[ $1 ]]; do
+        if [[ $1 =~ ^[0-9]+$ ]]; then
+            WAIT_FOR=$1
+        elif [[ $1 == "verbose" ]]; then
+            QUIET=""
+        else
+            STATUS_MSG=$1
+        fi
+        shift
+    done
+
+    timeout ${WAIT_FOR} sed ${QUIET} "/${STATUS_MSG}/ q" <(timeout $((WAIT_FOR + 5)) tail -n 0 -f /var/log/tomcat7/catalina.out)
+    STATUS=$?
+    if [[ ${STATUS} == 0 ]]; then
+        TOKEN=$(grep "$STATUS_MSG" /var/log/tomcat7/catalina.out)
+        echo Found requested token in Tomcat 7 startup log: "${TOKEN}";
+    else
+        echo Did not find requested token in Tomcat 7 startup log: "${STATUS_MSG}". The last lines in the log are:; tail -n 40 /var/log/tomcat7/catalina.out;
+    fi
+    return ${STATUS}
+}
+
+monitorTomcatStartup() {
+    monitorTomcatLog $@
+    STATUS=$?
+    [[ ${STATUS} == 0 ]] || { echo No start-up log for Tomcat 7 found at /var/log/tomcat7. Status unknown, exiting without monitoring start-up progress.; return ${STATUS}; }
+    monitorTomcatStatus $@
+    return $?
+}
+
+# Exit with error status
+die() {
+    echo >&2 "$@"
+    exit -1
+}

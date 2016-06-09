@@ -1,0 +1,56 @@
+#!/bin/bash
+
+ORIGIN=`dirname $0`
+
+source ${ORIGIN}/vars.sh
+source ${ORIGIN}/macros
+
+# tag argument takes priority
+[[ ! -z $1 ]] && CAPTURE_TAG=$1 || CAPTURE_TAG=${NAME}  # pulled from vars.sh
+#[[ -z "${1}" ]] && { CAPTAG=$(date +%Y%m%d%H%M%S); } || { CAPTAG=${1}; }
+
+[[ ! -d /resources/captures/${CAPTURE_TAG} ]] && mkdir -p /resources/captures/${CAPTURE_TAG}
+
+CAPTURE_DIR=/resources/captures/${CAPTURE_TAG}
+
+USER=`whoami`
+getProjectDir
+
+echo Capturing from ${PROJECT}
+
+echo Stopping Tomcat.
+sudo service tomcat7 stop
+sleep 5; # Just because the service command has returned doesn't mean the service stopped right then.
+
+pg_dump $PROJECT > $CAPTURE_DIR/database-$CAPTURE_TAG.sql
+[[ -f $CAPTURE_DIR/database-$CAPTURE_TAG.sql.zip ]] && sudo rm $CAPTURE_DIR/database-$CAPTURE_TAG.sql.zip
+zip -j -qdgds 10m $CAPTURE_DIR/database-$CAPTURE_TAG.sql.zip $CAPTURE_DIR/database-$CAPTURE_TAG.sql
+rm $CAPTURE_DIR/database-$CAPTURE_TAG.sql
+
+cd /data/$PROJECT/archive
+zip -rqdgds 10m ~/archive-$CAPTURE_TAG.zip *
+cd /data/$PROJECT/home/plugins
+zip -rqdgds 10m ~/plugins-$CAPTURE_TAG.zip *
+
+sudo chown -R $USER.$USER /resources/captures
+mv ~/*$CAPTURE_TAG*.zip $CAPTURE_DIR
+
+echo Moved all captured data to $CAPTURE_DIR:
+ls $CAPTURE_DIR
+
+echo Restarting Tomcat.
+startTomcat
+
+monitorTomcatStartup
+
+STATUS=$?
+if [[ ${STATUS} == 0 ]]; then
+    echo The application was started successfully.
+    exit 0
+else
+    echo The application does not appear to have started properly. Status code: ${STATUS}
+    echo The last lines in the log are:; tail -n 40 /var/log/tomcat7/catalina.out;
+fi
+
+exit ${STATUS}
+

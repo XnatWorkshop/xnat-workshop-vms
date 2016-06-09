@@ -1,0 +1,62 @@
+#!/bin/bash
+
+ORIGIN=`dirname $0`
+
+source ${ORIGIN}/vars.sh
+source ${ORIGIN}/macros
+
+# tag argument takes priority
+[[ ! -z $1 ]] && CAPTURE_TAG=$1 || CAPTURE_TAG=${NAME}  # pulled from vars.sh
+
+[[ -z $CAPTURE_TAG ]] && { echo You must specify the capture tag to restore; exit 127; }
+
+[[ ! -d /resources/captures/${CAPTURE_TAG} ]] && { echo "The folder for capture tag ${CAPTURE_TAG} does not exist. Exiting."; exit 126; }
+
+CAPTURE_DIR=/resources/captures/${CAPTURE_TAG}
+
+USER=`whoami`
+getProjectDir
+
+echo Restoring to capture ${CAPTURE_TAG} to project ${PROJECT}
+
+echo Stopping Tomcat.
+sudo service tomcat7 stop
+sleep 5; # Just because the service command has returned doesn't mean the service stopped right then.
+
+echo Dropping and recreating the database, importing $CAPTURE_DIR/database-$CAPTURE_TAG.sql.
+sudo -u postgres dropdb ${PROJECT}
+sudo -u postgres createdb -O ${VM_USER} ${PROJECT}
+
+[[ -f $CAPTURE_DIR/database-$CAPTURE_TAG.sql.zip ]] && { sudo unzip -d $CAPTURE_DIR $CAPTURE_DIR/database-$CAPTURE_TAG.sql.zip; }
+[[ -f $CAPTURE_DIR/database-$CAPTURE_TAG.sql ]] && { sudo -u ${VM_USER} psql -d ${PROJECT} -f $CAPTURE_DIR/database-$CAPTURE_TAG.sql; sudo rm $CAPTURE_DIR/database-$CAPTURE_TAG.sql; }
+
+# Restore the site URL from the local vars.sh if it differs from the site URL in the restored capture.
+CONFIGURED=$(sudo -u ${VM_USER} psql -t -c "select value from xhbm_preference where name = 'siteUrl'" | sed -e 's/ *$//' | sed 's/^ *//')
+CONTEXT=$(echo ${CONFIGURED} | awk -F/ '{print $4}')
+[[ ${CONFIGURED} == http://* ]] && { UPDATED=http://${SERVER}; } || { UPDATED=https://${SERVER}; }
+[[ ${CONTEXT} != "" ]] && { UPDATED="${UPDATED}/${CONTEXT}"; }
+[[ ${UPDATED} != ${CONFIGURED} ]] && { \
+    echo Setting the site URL to the configured server address: ${UPDATED}; \
+    sudo -u ${VM_USER} psql -t -c "update xhbm_preference set value = '${UPDATED}' where name = 'siteUrl'"; \
+}
+
+echo Clearing the archive folder and replacing with $CAPTURE_DIR/archive-$CAPTURE_TAG.zip.
+sudo rm -rf ${DATA_ROOT}/archive/*
+[[ -f $CAPTURE_DIR/archive-$CAPTURE_TAG.zip ]] && { sudo unzip -d ${DATA_ROOT}/archive $CAPTURE_DIR/archive-$CAPTURE_TAG.zip; }
+echo Clearing the plugins folder and replacing with $CAPTURE_DIR/plugins-$CAPTURE_TAG.zip.
+sudo rm -rf ${DATA_ROOT}/home/plugins/*
+[[ -f $CAPTURE_DIR/plugins-$CAPTURE_TAG.zip ]] && { sudo unzip -d ${DATA_ROOT}/home/plugins $CAPTURE_DIR/plugins-$CAPTURE_TAG.zip; }
+
+echo Restarting Tomcat.
+startTomcat
+monitorTomcatStartup
+
+STATUS=$?
+if [[ ${STATUS} == 0 ]]; then
+    echo The application was started successfully.
+else
+    echo The application does not appear to have started properly. Status code: ${STATUS}
+    echo The last lines in the log are:; tail -n 40 /var/log/tomcat7/catalina.out;
+fi
+
+exit ${STATUS}
